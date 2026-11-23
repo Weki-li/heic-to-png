@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HEIC → PNG 无损批量转换</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1f1f1e; --muted:#6b6b66; --line:#e3e3dd; --accent:#0f6e56; --accent2:#e1f5ee; --err:#a32d2d; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:900px; margin:0 auto; padding:36px 24px 60px; }
+  h1 { font-size:20px; font-weight:500; margin:0 0 6px; }
+  .sub { color:var(--muted); margin:0 0 24px; font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  #drop { border:1.5px dashed #b9b9b0; border-radius:12px; padding:40px 20px; text-align:center; cursor:pointer; background:var(--card); transition:.15s; }
+  #drop.over { border-color:var(--accent); background:var(--accent2); }
+  #drop strong { display:block; font-size:15px; font-weight:500; margin-bottom:4px; }
+  #drop span { color:var(--muted); font-size:12px; }
+  .bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-top:16px; }
+  button { font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:8px; padding:9px 18px; cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .progress { flex:1; min-width:180px; height:6px; background:#eee; border-radius:4px; overflow:hidden; }
+  .progress > i { display:block; height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .stat { color:var(--muted); font-size:12px; }
+  ul#list { list-style:none; padding:0; margin:0; }
+  #list li { display:flex; align-items:center; gap:12px; padding:9px 0; border-bottom:1px solid var(--line); font-size:13px; }
+  #list li:last-child { border-bottom:0; }
+  #list .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #list .size { color:var(--muted); font-size:12px; }
+  #list .st { min-width:64px; text-align:right; font-size:12px; }
+  #list .st.ok { color:var(--accent); }
+  #list .st.err { color:var(--err); }
+  #list button { padding:3px 9px; font-size:12px; }
+  .note { font-size:12px; color:var(--muted); background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .note b { color:var(--ink); font-weight:500; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  label.chk { display:inline-flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; }
+  #err { color:var(--err); font-size:13px; min-height:20px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>HEIC → PNG 无损批量转换</h1>
+  <p class="sub">纯本地运行 · 文件不上传 · 保留 10-bit 色深与 ICC 配置</p>
+
+  <div id="drop">
+    <strong>拖入 HEIC / HEIF 文件，或点击选择</strong>
+    <span>支持多选；每次处理建议不超过 100 张</span>
+  </div>
+  <input type="file" id="file" accept=".heic,.heif,image/heic,image/heif" multiple hidden>
+
+  <div class="card">
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="sidecar" checked> 导出 EXIF sidecar JSON（拍摄时间 / GPS）</label>
+    </div>
+    <div class="bar">
+      <button class="primary" id="start" disabled>开始转换</button>
+      <button id="download" disabled>下载全部（ZIP）</button>
+      <div class="progress"><i id="bar"></i></div>
+      <span class="stat" id="stat">就绪</span>
+    </div>
+    <div id="err"></div>
+  </div>
+
+  <div class="card"><ul id="list"></ul></div>
+
+  <div class="note">
+    <b>关于无损：</b>本工具用 libheif 直接解码为 10-bit 数据并写入 16-bit PNG，不经浏览器 8-bit Canvas，避免色深与色域损失。HEVC 源压缩本身的有损无法还原。PNG 体积通常为 HEIC 的 3–8 倍。<br>
+    <b>EXIF：</b>PNG 没有标准 EXIF 容器，勾选后时间与 GPS 存入同名 <code>.exif.json</code> 文件。
+  </div>
+</div>
+
+<script>/*__LIBHEIF__*/</script>
+<script>/*__FFLATE__*/</script>
+<script>
+"use strict";
+var $ = function(id){ return document.getElementById(id); };
+var state = { files:[], results:[], running:false, workers:[], queue:[], active:0 };
+
+function fmtSize(n){ return n<1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(1)+' KB' : (n/1048576).toFixed(1)+' MB'; }
+function setErr(msg){ $('err').textContent = msg || ''; }
+
+function render(){
+  var ul = $('list'); ul.innerHTML = '';
+  state.files.forEach(function(f,i){
+    var li = document.createElement('li');
+    var name = document.createElement('span'); name.className='name'; name.textContent=f.file.name;
+    var size = document.createElement('span'); size.className='size'; size.textContent=fmtSize(f.file.size);
+    var st = document.createElement('span'); st.className='st'+(f.status==='ok'?' ok':f.status==='err'?' err':'');
+    st.textContent = f.status==='ok'?'完成':f.status==='err'?'失败':f.status==='running'?'转换中':'等待';
+    li.appendChild(name); li.appendChild(size); li.appendChild(st);
+    if(f.status==='ok' && f.blob){
+      var b=document.createElement('button'); b.textContent='PNG';
+      b.onclick=function(){ saveBlob(f.blob, f.file.name.replace(/\.[^.]+$/,'')+'.png'); };
+      li.appendChild(b);
+      if(f.sidecar){
+        var j=document.createElement('button'); j.textContent='JSON';
+        j.onclick=function(){ saveBlob(f.sidecar, f.file.name.replace(/\.[^.]+$/,'')+'.exif.json'); };
+        li.appendChild(j);
+      }
+    }
+    ul.appendChild(li);
+  });
+  var done = state.files.filter(function(f){return f.status==='ok'||f.status==='err';}).length;
+  $('bar').style.width = state.files.length ? (done/state.files.length*100)+'%' : '0';
+  $('stat').textContent = state.files.length ? done+' / '+state.files.length : '就绪';
+  $('start').disabled = state.running || !state.files.some(function(f){return f.status==='wait';});
+  $('download').disabled = state.running || !state.results.length;
+}
+
+function saveBlob(blob, name){
+  var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name;
+  document.body.appendChild(a); a.click(); setTimeout(function(){URL.revokeObjectURL(a.href); a.remove();},1000);
+}
+
+function addFiles(list){
+  Array.prototype.forEach.call(list, function(f){
+    if(!/\.hei[cf]$/i.test(f.name) && f.type!=='image/heic' && f.type!=='image/heif') return;
+    state.files.push({ file:f, status:'wait' });
+  });
+  render();
+}
+
+$('drop').onclick = function(){ $('file').click(); };
+$('file').onchange = function(e){ addFiles(e.target.files); this.value=''; };
+['dragenter','dragover'].forEach(function(t){ $('drop').addEventListener(t,function(e){e.preventDefault(); $('drop').classList.add('over');}); });
+['dragleave','drop'].forEach(function(t){ $('drop').addEventListener(t,function(e){e.preventDefault(); $('drop').classList.remove('over');}); });
+$('drop').addEventListener('drop',function(e){ addFiles(e.dataTransfer.files); });
+
+/* Helper functions (main thread) */
+function crc32(buf){var t=crc32.t;if(!t){t=crc32.t=new Int32Array(256);for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++)c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);t[n]=c;}}var c=-1;for(var i=0;i<buf.length;i++)c=t[(c^buf[i])&255]^(c>>>8);return (c^-1)>>>0;}
+function chunk(type,data){var len=new Uint8Array(4);new DataView(len.buffer).setUint32(0,data.length);var td=new Uint8Array(type.length+data.length);for(var i=0;i<type.length;i++)td[i]=type.charCodeAt(i);td.set(data,type.length);var cr=new Uint8Array(4);new DataView(cr.buffer).setUint32(0,crc32(td));var out=new Uint8Array(12+data.length); out.set(len,0);out.set(td,4);out.set(cr,4+td.length);return out;}
+function joinParts(parts){var n=0;parts.forEach(function(p){n+=p.length;});var out=new Uint8Array(n),o=0;parts.forEach(function(p){out.set(p,o);o+=p.length;});return out;}
+function deflate(data){ return fflate.deflateSync(data,{level:6}); }
+function buildPNG(w,h,raw20,bpp,icc){
+  var sig=new Uint8Array([137,80,78,71,13,10,26,10]);
+  var ihdr=new Uint8Array(13);var dv=new DataView(ihdr.buffer);dv.setUint32(0,w);dv.setUint32(4,h);ihdr[8]=16;ihdr[9]=6;
+  var stride=w*8,row=stride+1,buf=new Uint8Array(row*h),shift=16-bpp;
+  for(var y=0;y<h;y++){var so=y*stride,di=y*row+1;buf[y*row]=0;
+    for(var x=0;x<stride;x+=2){var v=(raw20[so+x]<<8|raw20[so+x+1])<<shift;buf[di+x]=v>>8;buf[di+x+1]=v&255;}}
+   var parts=[sig,chunk('IHDR',ihdr)]; 
+  if(icc&&icc.length){var body=new Uint8Array(5+icc.length);body.set([73,67,67,0],0);body.set(deflate(icc),5);parts.push(chunk('iCCP',body));}
+  var idat=deflate(buf);  parts.push(chunk('IDAT',idat),chunk('IEND',new Uint8Array(0))); 
+  return joinParts(parts);
+}
+function readICC(h,L){try{var n=L.heif_image_handle_get_raw_color_profile_size(h);if(!n)return null;var p=L._malloc(n);var e=L.heif_image_handle_get_raw_color_profile(h,p,n);if(e&&e.code){L._free(p);return null;}var d=new Uint8Array(L.HEAPU8.subarray(p,p+n));L._free(p);return d;}catch(e){return null;}}
+function readExif(h,L){try{var n=L.heif_image_handle_get_number_of_metadata_blocks(h,'Exif');if(!n)return null;var p=L._malloc(n*4);var c=L.heif_image_handle_get_list_of_metadata_block_IDs(h,'Exif',p,n);var ids=[];for(var i=0;i<n;i++)ids[i]=L.HEAP32[(p>>2)+i];L._free(p);var out=[];for(var j=0;j<c;j++){var sz=L.heif_image_handle_get_metadata_size(h,ids[j]);if(!sz)continue;var q=L._malloc(sz);var e=L.heif_image_handle_get_metadata(h,ids[j],q);if(e&&e.code){L._free(q);continue;}out.push(new Uint8Array(L.HEAPU8.subarray(q,q+sz)));L._free(q);}return out.length?out:null;}catch(e){return null;}}
+
+var heifLib=null;
+async function getLib(){ if(!heifLib) heifLib=await libheif(); return heifLib; }
+
+async function convertOne(item){
+  var L=await getLib(); 
+  var buf=await item.file.arrayBuffer();
+  var dec=new L.HeifDecoder();
+  var arr=dec.decode(new Uint8Array(buf));
+  if(!arr.length) throw new Error('无法解码：非 HEIC 或文件损坏');
+  var handle=arr[0].handle;
+  console.log("step decoded arr",arr.length); var r=L.heif_js_decode_image2(handle,L.heif_colorspace.heif_colorspace_RGB,L.heif_chroma.heif_chroma_interleaved_RRGGBBAA_BE);
+  var ch=r.channels[0],bpp=ch.bits_per_pixel||10,w=r.width,h=r.height;
+  console.log("step ch",bpp,w,h,ch.data.length); var raw=new Uint8Array(ch.data);
+  console.log("step raw",raw.length); var icc=readICC(handle,L),exifs=readExif(handle,L); 
+  var png=buildPNG(w,h,raw,bpp,icc); console.log("step png",png.length);
+  L.heif_image_release(r.image);
+  return {png:png,bpp:bpp,w:w,h:h,icc:!!icc,exifs:exifs};
+}
+
+$('start').onclick=async function(){
+  setErr('');
+  state.results=[];
+  var pending=state.files.filter(function(f){return f.status==='wait'||f.status==='err';});
+  pending.forEach(function(f){f.status='wait';});
+  if(!pending.length) return;
+  state.running=true; render();
+  var ok=0;
+  for(var i=0;i<pending.length;i++){
+    var item=pending[i]; item.status='running'; render();
+    try{
+      var res=await convertOne(item);
+      item.status='ok';
+      item.blob=new Blob([res.png],{type:'image/png'});
+      item.meta={w:res.w,h:res.h,bpp:res.bpp,icc:res.icc};
+      if($('sidecar').checked && res.exifs){
+        var sb=parseExifToJson(res.exifs,item.file.name,res);
+        if(sb) item.sidecar=sb;
+      }
+      state.results.push(item); ok++;
+    }catch(e){ item.status='err'; item.error=(e&&e.message)||String(e); item.stack=e&&e.stack; }
+    render();
+    await new Promise(function(r){setTimeout(r,0);});
+  }
+  state.running=false; render();
+  setErr('完成：'+ok+' / '+pending.length+' 张已转换。');
+};
+
+$('download').onclick=async function(){
+  setErr('正在打包…');
+  var zip={};
+  for(var i=0;i<state.results.length;i++){
+    var r=state.results[i];
+    var base=r.file.name.replace(/\.[^.]+$/,'');
+    zip[base+'.png']=new Uint8Array(await r.blob.arrayBuffer());
+    if(r.sidecar) zip[base+'.exif.json']=new Uint8Array(await r.sidecar.arrayBuffer());
+  }
+  var zipped=fflate.zipSync(zip,{level:1});
+  saveBlob(new Blob([zipped],{type:'application/zip'}),'HEIC转PNG_'+new Date().toISOString().slice(0,10)+'.zip');
+  setErr('');
+};
+
+function parseExifToJson(arrays, filename, res){
+  try{
+    var out={ source:filename, width:res.w, height:res.h, bitDepth:16, decodedBits:res.bpp, iccPreserved:res.icc, dateTimeOriginal:null, gps:null };
+    for(var i=0;i<arrays.length;i++){
+      var b=new Uint8Array(arrays[i]);
+      if(b.length<8) continue;
+      var le=(b[0]===0x49&&b[1]===0x49), be=(b[0]===0x4D&&b[1]===0x4D);
+      var off=le?b.readUInt32LE?0:0:0;
+      var dv=new DataView(b.buffer,b.byteOffset,b.byteLength);
+      var bo=(b[0]===0x49)?true:false;
+      var tiff=be?4:2;
+      if(b[2]!==0x2A&&!(b[2]===0x2A)) continue;
+      var ifd=dv.getUint32(4,bo);
+      var parse=function(base){
+        var o=base,n=dv.getUint16(o,bo);o+=2;var exifIfd=null,gpsIfd=null;
+        for(var k=0;k<n;k++){
+          var e=o+k*12,tag=dv.getUint16(e,bo),type=dv.getUint16(e+2,bo),cnt=dv.getUint32(e+4,bo),val=dv.getUint32(e+8,bo);
+          if(tag===0x8769) exifIfd=val;
+          if(tag===0x8825) gpsIfd=val;
+          if(tag===0x9003&&type===2){ var s='',p=val;for(var q=0;q<Math.min(cnt,32)-1;q++){s+=String.fromCharCode(dv.getUint8(p+q));}out.dateTimeOriginal=s.trim('\0'); }
+          if(tag===0x0132&&type===2&&!out.dateTimeOriginal){ var s2='',p2=val;for(var q2=0;q2<Math.min(cnt,32)-1;q2++){s2+=String.fromCharCode(dv.getUint8(p2+q2));}out.dateTimeOriginal=s2.trim('\0'); }
+        }
+        return {exif:exifIfd,gps:gpsIfd};
+      };
+      var links=parse(ifd);
+      if(links.gps){
+        var go=links.gps,gn=dv.getUint16(go,bo),lat=null,lon=null,latRef='',lonRef='';
+        for(var g=0;g<gn;g++){
+          var ge=go+2+g*12,tag=dv.getUint16(ge,bo),type=dv.getUint16(ge+2,bo),cnt=dv.getUint32(ge+4,bo),vp=ge+8;
+          if(tag===0x0001){ latRef=String.fromCharCode(dv.getUint8(ge+8)); }
+          if(tag===0x0003){ latRef=String.fromCharCode(dv.getUint8(ge+8)); }
+          if(tag===0x0002&&type===5){ lat=readRat(dv,vp,bo); }
+          if(tag===0x0004&&type===5){ lonRef=String.fromCharCode(dv.getUint8(ge+8)); }
+          if(tag===0x0006&&type===5){ lon=readRat(dv,vp,bo); }
+        }
+        if(lat||lon) out.gps={ latitude:lat, longitude:lon, latRef:latRef, lonRef:lonRef };
+      }
+    }
+    return new Blob([JSON.stringify(out,null,2)],{type:'application/json'});
+  }catch(e){ return null; }
+}
+function readRat(dv,p,bo){ try{var n=dv.getUint32(p,bo),d=dv.getUint32(p+4,bo);return d?n/d:null;}catch(e){return null;} }
+
+render();
+</script>
+</body>
+</html>
